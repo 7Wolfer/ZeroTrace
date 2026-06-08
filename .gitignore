@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# ZeroTrace runtime data (certs, user presets)
+# Uncomment if you don't want to share user presets:
+# %APPDATA%/ZeroTrace/
