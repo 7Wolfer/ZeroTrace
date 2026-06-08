@@ -4,6 +4,7 @@ from pathlib import Path
 
 # All known launcher paths, in priority order
 _LAUNCHERS = [
+    'Voidstrap',   # Voidstrap (custom launcher)
     'Bloxstrap',   # Bloxstrap (custom launcher)
     'Roblox',      # Official Roblox launcher
 ]
