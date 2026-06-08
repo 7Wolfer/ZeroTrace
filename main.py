@@ -27,14 +27,20 @@ def _is_admin() -> bool:
         return False
 
 
+def _pythonw() -> str:
+    """Return path to pythonw.exe (no console window), fallback to python.exe."""
+    exe = sys.executable
+    candidate = exe.replace('python.exe', 'pythonw.exe')
+    return candidate if os.path.exists(candidate) else exe
+
+
 def _relaunch_as_admin():
-    """Re-launch this script with UAC elevation and exit current process."""
+    """Re-launch this script elevated, using pythonw so no console window appears."""
     script = os.path.abspath(sys.argv[0])
     params = ' '.join(f'"{a}"' for a in sys.argv[1:])
     ret = ctypes.windll.shell32.ShellExecuteW(
-        None, 'runas', sys.executable, f'"{script}" {params}', None, 1
+        None, 'runas', _pythonw(), f'"{script}" {params}', None, 1
     )
-    # ret <= 32 means failure
     return ret > 32
 
 
