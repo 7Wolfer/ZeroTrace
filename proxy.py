@@ -208,6 +208,24 @@ def _bidirectional_pipe(a, b):
     ev.wait()
 
 
+def _close_graceful(sock):
+    """Shutdown send side first so the peer reads all data before RST."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    try:
+        sock.settimeout(1.0)
+        while sock.recv(4096):
+            pass
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
 def _recv_header(sock) -> bytes:
     """Read until \\r\\n\\r\\n."""
     buf = b''
@@ -230,16 +248,13 @@ class _ConnectionHandler(threading.Thread):
 
     def run(self):
         try:
-            self._handle()
+            self._dispatch()
         except Exception as e:
             log.debug('Handler error: %s', e)
         finally:
-            try:
-                self._client.close()
-            except OSError:
-                pass
+            _close_graceful(self._client)
 
-    def _handle(self):
+    def _dispatch(self):
         raw = _recv_header(self._client)
         if not raw:
             return
