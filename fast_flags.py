@@ -2,10 +2,15 @@ import os
 import json
 from pathlib import Path
 
+# All known launcher paths, in priority order
+_LAUNCHERS = [
+    'Bloxstrap',   # Bloxstrap (custom launcher)
+    'Roblox',      # Official Roblox launcher
+]
 
-def find_roblox_version_path() -> Path | None:
-    local = os.environ.get('LOCALAPPDATA', '')
-    versions = Path(local) / 'Roblox' / 'Versions'
+
+def _search_versions(base: Path) -> Path | None:
+    versions = base / 'Versions'
     if not versions.exists():
         return None
     candidates = [
@@ -15,6 +20,23 @@ def find_roblox_version_path() -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def find_roblox_version_path() -> Path | None:
+    local = os.environ.get('LOCALAPPDATA', '')
+    for launcher in _LAUNCHERS:
+        result = _search_versions(Path(local) / launcher)
+        if result:
+            return result
+    return None
+
+
+def get_launcher_name() -> str:
+    local = os.environ.get('LOCALAPPDATA', '')
+    for launcher in _LAUNCHERS:
+        if _search_versions(Path(local) / launcher):
+            return launcher
+    return 'Unknown'
 
 
 def get_settings_path() -> Path | None:
@@ -37,7 +59,8 @@ def apply_flags(flags: dict) -> None:
     path = get_settings_path()
     if path is None:
         raise RuntimeError(
-            'Roblox installation not found in %LOCALAPPDATA%\\Roblox\\Versions\\'
+            'Roblox not found. Checked: '
+            + ', '.join(f'%LOCALAPPDATA%\\{l}\\Versions' for l in _LAUNCHERS)
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
@@ -54,4 +77,6 @@ def restore_flags() -> bool:
 
 def get_roblox_version_label() -> str:
     p = find_roblox_version_path()
-    return p.name if p else 'Not found'
+    if p is None:
+        return 'Not found'
+    return f'{get_launcher_name()}  •  {p.name}'
