@@ -1,55 +1,121 @@
 """
-Local MITM proxy that intercepts HTTPS traffic to assetdelivery.roblox.com
-and blocks specific asset IDs while forwarding everything else.
+Asset Blocker — hosts-file redirect + local HTTPS server.
 
-Requires the `cryptography` package for certificate generation.
-On first use, install the self-signed CA via the UI (needs admin rights once).
+Flow:
+  1. Resolve real IP of assetdelivery.roblox.com  (before touching DNS)
+  2. Write  127.0.0.1  assetdelivery.roblox.com  to the hosts file
+  3. Start a local TLS server on 127.0.0.1:443 presenting our fake cert
+  4. Roblox connects thinking it's the real CDN
+  5. Blocked ID → 404.  Not blocked → forward to the real IP directly.
+
+Requires administrator rights (port 443 + hosts file write).
 """
 
+import ctypes
+import datetime
+import logging
+import os
+import re
 import socket
 import ssl
-import threading
-import re
-import os
 import subprocess
-import ctypes
-import logging
+import threading
 from pathlib import Path
 
 try:
     import winreg
-    WINREG_OK = True
+    _WINREG = True
 except ImportError:
-    WINREG_OK = False
+    _WINREG = False
 
 try:
     from cryptography import x509
-    from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    import datetime
+    from cryptography.x509.oid import NameOID
     CRYPTO_OK = True
 except ImportError:
     CRYPTO_OK = False
 
-PROXY_HOST = '127.0.0.1'
-PROXY_PORT = 8888
-INTERCEPT_HOSTS = {'assetdelivery.roblox.com'}
-CERTS_DIR = Path(os.environ.get('APPDATA', '.')) / 'ZeroTrace' / 'certs'
+INTERCEPT_HOST = 'assetdelivery.roblox.com'
+SERVER_ADDR    = '127.0.0.1'
+SERVER_PORT    = 443
+PROXY_PORT     = SERVER_PORT          # kept so ui.py can import it
+
+HOSTS_PATH  = Path(r'C:\Windows\System32\drivers\etc\hosts')
+HOSTS_MARK  = '# ZeroTrace'
+CERTS_DIR   = Path(os.environ.get('APPDATA', '.')) / 'ZeroTrace' / 'certs'
 
 log = logging.getLogger('zerotrace.proxy')
 
 
-# ─── Certificate Management ──────────────────────────────────────────────────
+# ─── Admin check ─────────────────────────────────────────────────────────────
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# ─── Hosts file ──────────────────────────────────────────────────────────────
+
+class HostsManager:
+    def add(self, host: str) -> bool:
+        try:
+            text = HOSTS_PATH.read_text(encoding='utf-8', errors='replace')
+            if f'{host} {HOSTS_MARK}' in text:
+                return True
+            # Remove any existing line for this host (without our marker)
+            clean = '\n'.join(
+                ln for ln in text.splitlines()
+                if host not in ln.split() or HOSTS_MARK in ln
+            )
+            entry = f'\n127.0.0.1 {host} {HOSTS_MARK}\n'
+            HOSTS_PATH.write_text(clean.rstrip('\n') + entry, encoding='utf-8')
+            self._flush()
+            return True
+        except PermissionError:
+            return False
+        except Exception as e:
+            log.error('hosts add: %s', e)
+            return False
+
+    def remove(self, host: str) -> None:
+        try:
+            lines = HOSTS_PATH.read_text(encoding='utf-8', errors='replace').splitlines(keepends=True)
+            kept = [ln for ln in lines if not (host in ln and HOSTS_MARK in ln)]
+            HOSTS_PATH.write_text(''.join(kept), encoding='utf-8')
+            self._flush()
+        except Exception as e:
+            log.error('hosts remove: %s', e)
+
+    def is_active(self, host: str) -> bool:
+        try:
+            txt = HOSTS_PATH.read_text(encoding='utf-8', errors='replace')
+            return host in txt and HOSTS_MARK in txt
+        except Exception:
+            return False
+
+    @staticmethod
+    def _flush():
+        subprocess.run(
+            ['ipconfig', '/flushdns'],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+
+
+# ─── Certificate manager ─────────────────────────────────────────────────────
 
 class CertManager:
     CA_CN = 'ZeroTrace Asset Blocker CA'
 
     def __init__(self):
         CERTS_DIR.mkdir(parents=True, exist_ok=True)
-        self._ca_key_path = CERTS_DIR / 'ca.key'
+        self._ca_key_path  = CERTS_DIR / 'ca.key'
         self._ca_cert_path = CERTS_DIR / 'ca.crt'
-        self.ca_key = None
+        self.ca_key  = None
         self.ca_cert = None
         if CRYPTO_OK:
             self._init_ca()
@@ -64,72 +130,59 @@ class CertManager:
             self._generate_ca()
 
     def _generate_ca(self):
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key  = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, self.CA_CN),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'ZeroTrace'),
+            x509.NameAttribute(NameOID.COMMON_NAME,          self.CA_CN),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME,    'ZeroTrace'),
         ])
-        now = datetime.datetime.utcnow()
+        now  = datetime.datetime.utcnow()
         cert = (
             x509.CertificateBuilder()
-            .subject_name(name)
-            .issuer_name(name)
+            .subject_name(name).issuer_name(name)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now)
             .not_valid_after(now + datetime.timedelta(days=3650))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=True, content_commitment=False,
-                    key_encipherment=False, data_encipherment=False,
-                    key_agreement=False, key_cert_sign=True,
-                    crl_sign=True, encipher_only=False, decipher_only=False,
-                ),
-                critical=True,
-            )
+            .add_extension(x509.KeyUsage(
+                digital_signature=True, content_commitment=False,
+                key_encipherment=False, data_encipherment=False,
+                key_agreement=False, key_cert_sign=True,
+                crl_sign=True, encipher_only=False, decipher_only=False,
+            ), critical=True)
             .sign(key, hashes.SHA256())
         )
         with open(self._ca_key_path, 'wb') as f:
-            f.write(key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL,
-                serialization.NoEncryption(),
-            ))
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.TraditionalOpenSSL,
+                                       serialization.NoEncryption()))
         with open(self._ca_cert_path, 'wb') as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
-        self.ca_key = key
+        self.ca_key  = key
         self.ca_cert = cert
 
     def host_cert(self, hostname: str) -> tuple[str, str]:
-        """Return (cert_path, key_path) for hostname, generating if needed."""
         safe = hostname.replace('.', '_')
-        crt = CERTS_DIR / f'{safe}.crt'
-        key = CERTS_DIR / f'{safe}.key'
+        crt  = CERTS_DIR / f'{safe}.crt'
+        key  = CERTS_DIR / f'{safe}.key'
         if not crt.exists():
-            k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            k    = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-            now = datetime.datetime.utcnow()
-            c = (
+            now  = datetime.datetime.utcnow()
+            c    = (
                 x509.CertificateBuilder()
-                .subject_name(name)
-                .issuer_name(self.ca_cert.subject)
+                .subject_name(name).issuer_name(self.ca_cert.subject)
                 .public_key(k.public_key())
                 .serial_number(x509.random_serial_number())
                 .not_valid_before(now)
                 .not_valid_after(now + datetime.timedelta(days=825))
-                .add_extension(
-                    x509.SubjectAlternativeName([x509.DNSName(hostname)]),
-                    critical=False,
-                )
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
                 .sign(self.ca_key, hashes.SHA256())
             )
             with open(key, 'wb') as f:
-                f.write(k.private_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PrivateFormat.TraditionalOpenSSL,
-                    serialization.NoEncryption(),
-                ))
+                f.write(k.private_bytes(serialization.Encoding.PEM,
+                                         serialization.PrivateFormat.TraditionalOpenSSL,
+                                         serialization.NoEncryption()))
             with open(crt, 'wb') as f:
                 f.write(c.public_bytes(serialization.Encoding.PEM))
         return str(crt), str(key)
@@ -163,53 +216,41 @@ class CertManager:
         return r.returncode == 0
 
 
-# ─── Asset ID extraction ─────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 _ID_PATTERNS = [
-    re.compile(r'[?&]id=(\d+)', re.IGNORECASE),
-    re.compile(r'/assetId/(\d+)', re.IGNORECASE),
+    re.compile(r'[?&]id=(\d+)',       re.IGNORECASE),
+    re.compile(r'/assetId/(\d+)',     re.IGNORECASE),
     re.compile(r'/(\d{6,})(?:[/?]|$)'),
 ]
 
 
-def _extract_asset_id(path_and_query: str) -> str | None:
+def _extract_asset_id(path: str) -> str | None:
     for p in _ID_PATTERNS:
-        m = p.search(path_and_query)
+        m = p.search(path)
         if m:
             return m.group(1)
     return None
 
 
-# ─── Proxy connection handler ─────────────────────────────────────────────────
-
-def _pipe(src, dst, stop_event: threading.Event):
-    try:
-        while not stop_event.is_set():
-            try:
-                data = src.recv(32768)
-            except (OSError, ssl.SSLError):
-                break
-            if not data:
-                break
-            try:
-                dst.sendall(data)
-            except (OSError, ssl.SSLError):
-                break
-    finally:
-        stop_event.set()
+def _recv_header(sock, timeout: float = 30.0) -> bytes:
+    """Read HTTP headers (until \\r\\n\\r\\n)."""
+    sock.settimeout(timeout)
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        try:
+            chunk = sock.recv(4096)
+        except (socket.timeout, OSError):
+            break
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > 65536:
+            break
+    return buf
 
 
-def _bidirectional_pipe(a, b):
-    ev = threading.Event()
-    t1 = threading.Thread(target=_pipe, args=(a, b, ev), daemon=True)
-    t2 = threading.Thread(target=_pipe, args=(b, a, ev), daemon=True)
-    t1.start()
-    t2.start()
-    ev.wait()
-
-
-def _close_graceful(sock):
-    """Shutdown send side first so the peer reads all data before RST."""
+def _close(sock) -> None:
     try:
         sock.shutdown(socket.SHUT_WR)
     except OSError:
@@ -226,177 +267,116 @@ def _close_graceful(sock):
         pass
 
 
-def _recv_header(sock) -> bytes:
-    """Read until \\r\\n\\r\\n."""
-    buf = b''
-    while b'\r\n\r\n' not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-        if len(buf) > 65536:
-            break
-    return buf
+def _pipe(src, dst, ev: threading.Event) -> None:
+    try:
+        while not ev.is_set():
+            try:
+                data = src.recv(32768)
+            except (OSError, ssl.SSLError):
+                break
+            if not data:
+                break
+            try:
+                dst.sendall(data)
+            except (OSError, ssl.SSLError):
+                break
+    finally:
+        ev.set()
 
 
-class _ConnectionHandler(threading.Thread):
-    def __init__(self, client: socket.socket, blocked: set, certs: CertManager | None):
+def _bidir_pipe(a, b) -> None:
+    ev = threading.Event()
+    threading.Thread(target=_pipe, args=(a, b, ev), daemon=True).start()
+    threading.Thread(target=_pipe, args=(b, a, ev), daemon=True).start()
+    ev.wait()
+
+
+# ─── Per-connection handler ───────────────────────────────────────────────────
+
+class _Conn(threading.Thread):
+    """Handles one incoming TLS connection from Roblox."""
+
+    def __init__(
+        self,
+        raw_client: socket.socket,
+        ssl_ctx:    ssl.SSLContext,
+        real_ip:    str,
+        blocked:    set[str],
+    ):
         super().__init__(daemon=True)
-        self._client = client
+        self._raw     = raw_client
+        self._ctx     = ssl_ctx
+        self._real_ip = real_ip
         self._blocked = blocked
-        self._certs = certs
 
     def run(self):
         try:
-            self._dispatch()
+            self._process()
         except Exception as e:
-            log.debug('Handler error: %s', e)
+            log.debug('Conn error: %s', e)
         finally:
-            _close_graceful(self._client)
+            _close(self._raw)
 
-    def _dispatch(self):
-        raw = _recv_header(self._client)
-        if not raw:
-            return
-        first_line = raw.split(b'\r\n', 1)[0].decode('latin-1', errors='replace')
-        parts = first_line.split(' ')
-        if len(parts) < 2:
-            return
-        method = parts[0].upper()
-        if method == 'CONNECT':
-            self._handle_connect(parts[1])
-        else:
-            self._handle_plain_http(method, parts[1], raw)
-
-    # ── CONNECT (HTTPS) ────────────────────────────────────────────────────
-
-    def _handle_connect(self, target: str):
-        host, _, port_s = target.rpartition(':')
-        host = host or target
-        port = int(port_s) if port_s.isdigit() else 443
-
-        if host in INTERCEPT_HOSTS and CRYPTO_OK and self._certs and self._certs.ca_key:
-            self._handle_mitm(host, port)
-        else:
-            self._tunnel_connect(host, port)
-
-    def _tunnel_connect(self, host: str, port: int):
+    def _process(self):
         try:
-            srv = socket.create_connection((host, port), timeout=15)
-        except OSError:
-            self._client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            return
-        self._client.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
-        try:
-            _bidirectional_pipe(self._client, srv)
-        finally:
-            srv.close()
-
-    def _handle_mitm(self, host: str, port: int):
-        try:
-            crt_path, key_path = self._certs.host_cert(host)
-        except Exception as e:
-            log.error('Cert gen failed for %s: %s', host, e)
-            self._tunnel_connect(host, port)
-            return
-
-        self._client.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
-
-        ctx_srv = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx_srv.load_cert_chain(crt_path, key_path)
-        try:
-            ssl_client = ctx_srv.wrap_socket(self._client, server_side=True)
+            client = self._ctx.wrap_socket(self._raw, server_side=True)
         except ssl.SSLError as e:
-            log.debug('Client SSL handshake failed: %s', e)
+            log.debug('TLS handshake failed: %s', e)
             return
 
         try:
-            self._intercept_https(ssl_client, host, port)
-        finally:
-            try:
-                ssl_client.close()
-            except OSError:
-                pass
+            headers = _recv_header(client)
+            if not headers:
+                return
 
-    def _intercept_https(self, ssl_client: ssl.SSLSocket, host: str, port: int):
-        # Read first request from client
-        raw = _recv_header(ssl_client)
-        if not raw:
-            return
+            first = headers.split(b'\r\n', 1)[0].decode('latin-1', errors='replace')
+            parts = first.split(' ')
+            path  = parts[1] if len(parts) >= 2 else '/'
 
-        first_line = raw.split(b'\r\n', 1)[0].decode('latin-1', errors='replace')
-        parts = first_line.split(' ')
-        path = parts[1] if len(parts) >= 2 else '/'
-
-        asset_id = _extract_asset_id(path)
-        if asset_id and asset_id in self._blocked:
-            log.info('Blocked asset ID %s', asset_id)
-            ssl_client.sendall(
-                b'HTTP/1.1 404 Not Found\r\n'
-                b'Content-Length: 0\r\n'
-                b'Connection: close\r\n\r\n'
-            )
-            return
-
-        # Forward: connect to real server, send first request, then pipe
-        ctx = ssl.create_default_context()
-        try:
-            raw_srv = socket.create_connection((host, port), timeout=15)
-            ssl_srv = ctx.wrap_socket(raw_srv, server_hostname=host)
-        except OSError as e:
-            log.debug('Cannot reach %s:%d — %s', host, port, e)
-            ssl_client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            return
-
-        try:
-            ssl_srv.sendall(raw)
-            _bidirectional_pipe(ssl_client, ssl_srv)
-        finally:
-            ssl_srv.close()
-
-    # ── Plain HTTP ─────────────────────────────────────────────────────────
-
-    def _handle_plain_http(self, method: str, url: str, raw: bytes):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(url)
-            host = p.hostname or ''
-            port = p.port or 80
-            path = p.path + (('?' + p.query) if p.query else '')
-        except Exception:
-            self._client.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
-            return
-
-        if host in INTERCEPT_HOSTS:
             asset_id = _extract_asset_id(path)
             if asset_id and asset_id in self._blocked:
-                log.info('Blocked HTTP asset ID %s', asset_id)
-                self._client.sendall(
-                    b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+                log.info('Blocked asset %s', asset_id)
+                client.sendall(
+                    b'HTTP/1.1 404 Not Found\r\n'
+                    b'Content-Length: 0\r\n'
+                    b'Connection: close\r\n\r\n'
                 )
                 return
 
-        try:
-            srv = socket.create_connection((host, port), timeout=15)
-        except OSError:
-            self._client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            return
-        try:
-            srv.sendall(raw)
-            _bidirectional_pipe(self._client, srv)
+            # Forward to real server (bypassing our hosts entry via direct IP)
+            try:
+                raw_srv = socket.create_connection((self._real_ip, 443), timeout=15)
+                ctx_fwd = ssl.create_default_context()
+                srv     = ctx_fwd.wrap_socket(raw_srv, server_hostname=INTERCEPT_HOST)
+            except OSError as e:
+                log.error('Cannot reach real server %s: %s', self._real_ip, e)
+                client.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+                return
+
+            try:
+                srv.sendall(headers)          # replay the buffered request
+                _bidir_pipe(client, srv)      # stream everything else
+            finally:
+                _close(srv)
         finally:
-            srv.close()
+            try:
+                client.close()
+            except OSError:
+                pass
 
 
-# ─── Proxy server ─────────────────────────────────────────────────────────────
+# ─── Main proxy class ─────────────────────────────────────────────────────────
 
 class AssetBlockerProxy:
     def __init__(self):
-        self._blocked: set[str] = set()
-        self._certs = CertManager() if CRYPTO_OK else None
-        self._server: socket.socket | None = None
-        self._thread: threading.Thread | None = None
-        self._running = False
+        self._blocked:  set[str]              = set()
+        self._certs:    CertManager           = CertManager()
+        self._hosts:    HostsManager          = HostsManager()
+        self._server:   socket.socket | None  = None
+        self._thread:   threading.Thread | None = None
+        self._ssl_ctx:  ssl.SSLContext | None  = None
+        self._real_ip:  str                   = ''
+        self._running:  bool                  = False
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -408,46 +388,80 @@ class AssetBlockerProxy:
     def crypto_available(self) -> bool:
         return CRYPTO_OK
 
-    def set_blocked(self, asset_ids: list):
+    def set_blocked(self, asset_ids: list) -> None:
         self._blocked = {str(a) for a in asset_ids}
 
-    def start(self) -> bool:
+    def start(self) -> tuple[bool, str]:
+        """Returns (ok, error_message)."""
         if self._running:
-            return True
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((PROXY_HOST, PROXY_PORT))
-            s.listen(100)
-            self._server = s
-            self._running = True
-            self._thread = threading.Thread(target=self._accept_loop, daemon=True)
-            self._thread.start()
-            _set_system_proxy(PROXY_HOST, PROXY_PORT)
-            return True
-        except OSError as e:
-            log.error('Proxy start failed: %s', e)
-            self._running = False
-            return False
+            return True, ''
 
-    def stop(self):
+        if not CRYPTO_OK:
+            return False, 'cryptography package not installed.'
+
+        if not self._certs.ca_key:
+            return False, 'CA certificate not generated.'
+
+        if not is_admin():
+            return False, 'Administrator rights required.'
+
+        # Resolve real IP before poisoning DNS
+        try:
+            self._real_ip = socket.getaddrinfo(INTERCEPT_HOST, 443,
+                                               proto=socket.IPPROTO_TCP)[0][4][0]
+            log.info('Resolved %s → %s', INTERCEPT_HOST, self._real_ip)
+        except OSError as e:
+            return False, f'DNS resolution failed: {e}'
+
+        # Build SSL context for our server
+        try:
+            crt, key    = self._certs.host_cert(INTERCEPT_HOST)
+            ctx         = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(crt, key)
+            self._ssl_ctx = ctx
+        except Exception as e:
+            return False, f'SSL context error: {e}'
+
+        # Bind to port 443
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((SERVER_ADDR, SERVER_PORT))
+            srv.listen(100)
+            self._server = srv
+        except OSError as e:
+            return False, f'Cannot bind to port 443: {e}'
+
+        # Modify hosts file
+        if not self._hosts.add(INTERCEPT_HOST):
+            self._server.close()
+            return False, 'Could not modify hosts file (need admin).'
+
+        self._running = True
+        self._thread  = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        log.info('Asset Blocker active on %s:%d', SERVER_ADDR, SERVER_PORT)
+        return True, ''
+
+    def stop(self) -> None:
         self._running = False
-        _clear_system_proxy()
+        self._hosts.remove(INTERCEPT_HOST)
         if self._server:
             try:
                 self._server.close()
             except OSError:
                 pass
             self._server = None
+        log.info('Asset Blocker stopped.')
 
     def ca_installed(self) -> bool:
-        return self._certs.is_installed() if self._certs else False
+        return self._certs.is_installed()
 
     def install_ca(self) -> bool:
-        return self._certs.install() if self._certs else False
+        return self._certs.install()
 
     def uninstall_ca(self) -> bool:
-        return self._certs.uninstall() if self._certs else False
+        return self._certs.uninstall()
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -455,58 +469,9 @@ class AssetBlockerProxy:
         self._server.settimeout(1.0)
         while self._running:
             try:
-                client, _ = self._server.accept()
+                raw, _ = self._server.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
-            _ConnectionHandler(client, self._blocked, self._certs).start()
-
-
-# ─── Windows proxy registry helpers ──────────────────────────────────────────
-
-def _set_system_proxy(host: str, port: int):
-    if not WINREG_OK:
-        return
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r'Software\Microsoft\Windows\CurrentVersion\Internet Settings',
-            0, winreg.KEY_WRITE,
-        )
-        winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, f'{host}:{port}')
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
-        # Bypass localhost so Windows apps aren't blocked
-        winreg.SetValueEx(
-            key, 'ProxyOverride', 0, winreg.REG_SZ,
-            'localhost;127.*;10.*;172.16.*;192.168.*;<local>',
-        )
-        winreg.CloseKey(key)
-        _notify_proxy_change()
-    except OSError as e:
-        log.error('Set proxy registry: %s', e)
-
-
-def _clear_system_proxy():
-    if not WINREG_OK:
-        return
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r'Software\Microsoft\Windows\CurrentVersion\Internet Settings',
-            0, winreg.KEY_WRITE,
-        )
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
-        winreg.CloseKey(key)
-        _notify_proxy_change()
-    except OSError as e:
-        log.error('Clear proxy registry: %s', e)
-
-
-def _notify_proxy_change():
-    try:
-        wininet = ctypes.windll.wininet
-        wininet.InternetSetOptionW(None, 39, None, 0)  # SETTINGS_CHANGED
-        wininet.InternetSetOptionW(None, 37, None, 0)  # REFRESH
-    except Exception:
-        pass
+            _Conn(raw, self._ssl_ctx, self._real_ip, self._blocked).start()

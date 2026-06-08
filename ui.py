@@ -12,7 +12,7 @@ import customtkinter as ctk
 
 import fast_flags as ff
 import presets as ps
-from proxy import AssetBlockerProxy, CRYPTO_OK, PROXY_PORT
+from proxy import AssetBlockerProxy, CRYPTO_OK, PROXY_PORT, is_admin
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
 
@@ -110,6 +110,19 @@ class ZeroTraceApp(ctk.CTk):
         )
         self._version_label.pack(padx=14, fill='x')
 
+        _divider(sb)
+
+        # Admin status
+        _label(sb, 'PRIVILEGES', padx=14)
+        if is_admin():
+            adm_txt, adm_col = '● Administrator', C_GREEN
+        else:
+            adm_txt, adm_col = '● User  (Asset Blocker limited)', C_YELLOW
+        ctk.CTkLabel(
+            sb, text=adm_txt,
+            font=ctk.CTkFont(size=11), text_color=adm_col, anchor='w',
+        ).pack(padx=14, pady=(2, 4), fill='x')
+
         # Push everything else to bottom
         ctk.CTkFrame(sb, fg_color='transparent').pack(expand=True)
 
@@ -199,8 +212,9 @@ class ZeroTraceApp(ctk.CTk):
         ctk.CTkLabel(
             tab,
             text=(
-                'Intercepts HTTPS traffic to assetdelivery.roblox.com and blocks listed asset IDs.\n'
-                'System proxy is set automatically when the proxy is active.'
+                'Redirects assetdelivery.roblox.com to a local HTTPS server via the hosts file.\n'
+                'Blocked asset IDs return 404. All other assets pass through normally.\n'
+                'Requires: Administrator + CA Certificate installed.'
             ),
             text_color=C_GRAY, font=ctk.CTkFont(size=10),
             justify='left', anchor='w',
@@ -356,15 +370,10 @@ class ZeroTraceApp(ctk.CTk):
 
     def _toggle_proxy(self):
         if self._proxy_switch.get():
-            success = self._proxy.start()
-            if not success:
+            ok, err = self._proxy.start()
+            if not ok:
                 self._proxy_switch.deselect()
-                messagebox.showerror(
-                    'Proxy Error',
-                    f'Could not bind to port {PROXY_PORT}.\n'
-                    'Another process may be using it.',
-                    parent=self,
-                )
+                messagebox.showerror('Asset Blocker Error', err, parent=self)
         else:
             self._proxy.stop()
         self._refresh_status()
@@ -431,7 +440,7 @@ class ZeroTraceApp(ctk.CTk):
 
         # Proxy
         if self._proxy.running:
-            self._proxy_pill.set_active(f'Active — proxy on port {PROXY_PORT}')
+            self._proxy_pill.set_active(f'Active — intercepting on port {PROXY_PORT}')
         else:
             self._proxy_pill.set_inactive('Inactive')
 
